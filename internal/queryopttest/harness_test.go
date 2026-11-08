@@ -9,6 +9,7 @@ import (
 	"pgregory.net/rapid"
 
 	"github.com/authzed/spicedb/internal/caveats"
+	"github.com/authzed/spicedb/internal/planequiv"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/query"
 	"github.com/authzed/spicedb/pkg/query/queryopt/optimization"
@@ -203,6 +204,50 @@ func TestSchemaDescription(t *testing.T) {
 	require.Nil(t, schemaDescription(nil))
 	c := testSchema(t, `definition user {}`)
 	require.Contains(t, schemaDescription(c.Schema), "definitions=")
+}
+
+// TestPlanEquivalenceValidatorIntegration proves the opt-in validator hook in
+// Config runs on every case: it accepts an equivalent transform, surfaces
+// validator setup errors, and rejects corrupt plans. The nil-validator path is
+// covered by every other harness test, which run without a validator and
+// therefore keep their original performance profile.
+func TestPlanEquivalenceValidatorIntegration(t *testing.T) {
+	c := testSchema(t, `definition user {}
+ definition document {
+ relation viewer: user
+ relation editor: user
+ permission view = viewer + editor
+ }`)
+	c.Relationships = []tuple.Relationship{
+		tuple.MustParse("document:o_a#viewer@user:o_a"),
+		tuple.MustParse("document:o_a#editor@user:o_b"),
+	}
+	c.Requests = Requests("document", "view", "user")
+
+	noop := optimization.Optimizer{Name: "noop", NewTransform: func(optimization.RequestParams) optimization.OutlineTransform {
+		return func(o query.Outline) query.Outline { return o }
+	}}
+
+	// An equivalent transform passes the enabled validator.
+	validator, err := planequiv.New()
+	require.NoError(t, err)
+	_, err = verifyCase(t.Context(), Config{Optimizer: noop, PlanEquivalenceValidator: validator}, c)
+	require.NoError(t, err)
+
+	// The hook must propagate validator-side setup errors, proving it is
+	// invoked with the case's finite model rather than being a dormant field.
+	restrictive, err := planequiv.New(planequiv.WithMaxRelationships(1))
+	require.NoError(t, err)
+	_, err = verifyCase(t.Context(), Config{Optimizer: noop, PlanEquivalenceValidator: restrictive}, c)
+	require.ErrorContains(t, err, "plan equivalence validator setup")
+
+	// A corrupt transform is rejected with the validator enabled (the built-in
+	// comparator and/or the validator both refuse the divergence).
+	drop := optimization.Optimizer{Name: "bad-drop", NewTransform: func(optimization.RequestParams) optimization.OutlineTransform {
+		return func(query.Outline) query.Outline { return query.Outline{Type: query.NullIteratorType} }
+	}}
+	_, err = verifyCase(t.Context(), Config{Optimizer: drop, PlanEquivalenceValidator: validator}, c)
+	require.Error(t, err)
 }
 
 func TestVerifyCaseRejectsInvalidCases(t *testing.T) {

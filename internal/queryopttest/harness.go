@@ -17,6 +17,7 @@ import (
 
 	"github.com/authzed/spicedb/internal/caveats"
 	"github.com/authzed/spicedb/internal/datastore/memdb"
+	"github.com/authzed/spicedb/internal/planequiv"
 	"github.com/authzed/spicedb/pkg/caveats/types"
 	"github.com/authzed/spicedb/pkg/datalayer"
 	"github.com/authzed/spicedb/pkg/datastore"
@@ -36,6 +37,17 @@ type Config struct {
 	Applicable func(optimization.RequestParams) bool
 	Cases      map[string]func(*rapid.T) Case
 	Setup      func(testing.TB)
+
+	// PlanEquivalenceValidator optionally enables the finite-model plan
+	// equivalence validator (internal/planequiv). When nil, the harness runs
+	// its built-in comparator only, so production-facing performance and
+	// behavior are unchanged. When set, every before/after outline pair is
+	// additionally replayed through independent local query contexts and
+	// rejected unless its observable semantics match on the case's finite
+	// models. The validator never applies the optimizer itself: it receives
+	// the two already-built plans, so a faulty candidate cannot be hidden by
+	// re-optimizing both sides.
+	PlanEquivalenceValidator *planequiv.PlanEquivalenceValidator
 }
 
 // Case contains a generated schema, its valid relationships and bounded requests.
@@ -181,6 +193,32 @@ func verifyCase(ctx context.Context, config Config, c Case) (bool, error) {
 			}
 			if err := compareResults(ctx, schemaReader, req.Params.Operation, left, right, caveatContext); err != nil {
 				return false, fmt.Errorf("semantic mismatch: %s request=%+v context=%v before=%s after=%s: %w", config.Optimizer.Name, req, caveatContext, describeOutline(before.Root), describeOutline(after.Root), err)
+			}
+		}
+
+		if config.PlanEquivalenceValidator != nil {
+			report, err := config.PlanEquivalenceValidator.Validate(ctx, planequiv.Input{
+				Schema:            c.Schema,
+				CaveatDefinitions: c.CaveatDefinitions,
+				Original:          before,
+				Candidate:         after,
+				Models: []planequiv.FiniteModel{{
+					Name:           "queryopttest-case",
+					Relationships:  c.Relationships,
+					CaveatContexts: contexts,
+				}},
+				Requests: []planequiv.Request{{
+					Operation:     req.Params.Operation,
+					Resource:      req.Resource,
+					Subject:       req.Subject,
+					SubjectFilter: query.NewType(req.Params.SubjectType, req.Params.SubjectRelation),
+				}},
+			})
+			if err != nil {
+				return false, fmt.Errorf("plan equivalence validator setup %+v: %w", req, err)
+			}
+			if !report.Equivalent {
+				return false, fmt.Errorf("plan equivalence validator rejected %s request=%+v: %s", config.Optimizer.Name, req, report.Counterexample.Difference)
 			}
 		}
 	}

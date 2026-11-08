@@ -76,3 +76,18 @@ setup-error artifacts do not belong in the shipped regression corpus.
 Harness self-tests deliberately add/remove access and strip conditional access.
 Comparator tests pin order/duplicate invariance, subject identities, missing
 context and wildcard exclusion behavior.
+
+## Optional PlanEquivalenceValidator hook
+
+`Config.PlanEquivalenceValidator` optionally enables the finite-model
+validator in `internal/planequiv`. When nil (the default), the harness keeps
+its original behavior and adds no validator work, so production-facing
+performance is unchanged. When set, each case additionally hands the
+already-built before/after `CanonicalOutline` pair — never re-optimized by the
+validator — to independent local query contexts over the case's finite
+models. HAS/NO/CONDITIONAL, CEL failures and recursion-budget exhaustion are
+compared as distinct, order-independent set classifications; the first
+divergence returns a versioned, data-only counterexample artifact. Optional
+delta debugging only deletes relationships or top-level context fields and
+reruns the real executor within a rerun cap. A passing report is scoped to the
+explicit finite models, not a datastore-wide equivalence proof.
